@@ -96,6 +96,15 @@ class _CONSOLE_CURSOR_INFO(ctypes.Structure):
         return f"win32<{self.dwSize}, {self.bVisible}>"
 
 
+class _Char(ctypes.Union):
+    _fields_ = [('UnicodeChar', ctypes.c_wchar),
+                ('AsciiChar', ctypes.c_char)]
+
+
+class _CHAR_INFO(ctypes.Structure):
+    _fields_ = [('Char', _Char),
+                ('Attributes', ctypes.c_ushort)]
+
 class CursorInformation:
     def __init__(self, size: int, visibility: bool):
         self.size = size
@@ -145,7 +154,8 @@ def _get_std_handle_errcheck(result, func, args):
     elif result is None:
         raise ConsoleError("The application does not have the associated standard handle provided.")
     return result
-        
+
+
 _GetStdHandle = ctypes.windll.kernel32.GetStdHandle
 _GetStdHandle.argtypes = [ctypes.c_ulong]
 _GetStdHandle.restype = ctypes.c_void_p
@@ -191,6 +201,21 @@ _SetConsoleTitleW.argtypes = [ctypes.c_wchar_p]
 _SetConsoleTitleW.restype = ctypes.c_int
 _SetConsoleTitleW.errcheck = _general_windows_errcheck
 
+_ReadConsoleOutputW = ctypes.windll.kernel32.ReadConsoleOutputW
+_ReadConsoleOutputW.argtypes = [ctypes.c_void_p, ctypes.POINTER(_CHAR_INFO), _COORD, _COORD, ctypes.POINTER(_SMALL_RECT)]
+_ReadConsoleOutputW.restype = ctypes.c_uint
+_ReadConsoleOutputW.errcheck = _general_windows_errcheck
+
+_ReadConsoleOutputA = ctypes.windll.kernel32.ReadConsoleOutputA
+_ReadConsoleOutputA.argtypes = [ctypes.c_void_p, ctypes.POINTER(_CHAR_INFO), _COORD, _COORD, ctypes.POINTER(_SMALL_RECT)]
+_ReadConsoleOutputA.restype = ctypes.c_uint
+_ReadConsoleOutputA.errcheck = _general_windows_errcheck
+
+_ReadConsoleOutputCharacterA = ctypes.windll.kernel32.ReadConsoleOutputCharacterA
+_ReadConsoleOutputCharacterA.argtypes = [ctypes.c_void_p, ctypes.c_char_p, ctypes.c_uint32, _COORD, ctypes.POINTER(ctypes.c_uint32)]
+_ReadConsoleOutputCharacterA.restype = ctypes.c_uint
+_ReadConsoleOutputCharacterA.errcheck = _general_windows_errcheck
+
 
 class ConsoleStandardHandle(enum.IntEnum):
     STD_INPUT_HANDLE = -10
@@ -219,6 +244,7 @@ class Console:
     
     def __init__(self, std_handle=ConsoleStandardHandle.STD_INPUT_HANDLE):
         self.handle = _GetStdHandle(std_handle)
+        print(self.handle)
         self.__default_cursor_info = self.__get_win32_cursor_info()
         self.__default_console_info = self.__get_win32_console_screen_buffer_info()
 
@@ -252,6 +278,7 @@ class Console:
         return CursorInformation._CursorInformation__from_CONSOLE_CURSOR_INFO(cci)
 
     def __get_win32_cursor_info(self):
+        print(self.handle)
         cci_out = _CONSOLE_CURSOR_INFO()
         _GetConsoleCursorInfo(self.handle, ctypes.byref(cci_out))
         return cci_out
@@ -288,8 +315,49 @@ class Console:
         _SetConsoleTextAttribute(self.handle, Console.CONSOLE_COLOR_ATTRIBUTE_MAP[background.lower()] << 4 | \
                                               Console.CONSOLE_COLOR_ATTRIBUTE_MAP[foreground.lower()])
     
-    def clear_line(self, y):
-        coord_screen = _COORD(0, y)
+    def read_console(self):
+        csbi = self.__get_win32_console_screen_buffer_info()
+        buffer_size = _COORD(0, 0)
+        buffer_coord = _COORD(0, 0)
+        rectangle = _SMALL_RECT()
+
+        rectangle.Left = csbi.srWindow.Left - 1
+        rectangle.Right = csbi.srWindow.Right - 1
+        rectangle.Top = csbi.srWindow.Top - 1
+        rectangle.Bottom = csbi.srWindow.Bottom - 1
+
+        buffer_size.X = rectangle.Right - rectangle.Left + 1
+        buffer_size.Y = rectangle.Bottom - rectangle.Top + 1
+        char_info_buffer = (_CHAR_INFO * (buffer_size.X * buffer_size.Y))()
+
+        _ReadConsoleOutputW(self.handle, ctypes.cast(char_info_buffer, ctypes.POINTER(_CHAR_INFO)), buffer_size, buffer_coord, ctypes.byref(rectangle))
+        char_buffer = ctypes.create_string_buffer(buffer_size.X * buffer_size.Y + 1)
+
+        for i, char_info in enumerate(char_info_buffer):
+            char_buffer[i] = char_info.Char.AsciiChar
+
+        strings = [None] * buffer_size.Y
+        for y in range(buffer_size.Y):
+            for x in range(buffer_size.X):
+                i = x + buffer_size.X * y
+                string = ctypes.string_at(ctypes.byref(char_buffer, i + 1), buffer_size.X - x) \
+                                        .decode('UTF-8') \
+                                        .replace('\x00', ' ') \
+                    
+                strings[y] = string
+                break
+        return strings
+
+    def read_console_line(self, y: int):
+        csbi = self.__get_win32_console_screen_buffer_info()
+        length = csbi.srWindow.Right - csbi.srWindow.Left - 1
+        char_buffer = ctypes.create_string_buffer(length + 1)
+        chars_read = ctypes.c_ulong(0)
+        _ReadConsoleOutputCharacterA(self.handle, ctypes.cast(ctypes.byref(char_buffer), ctypes.c_char_p), length, _COORD(0, y), ctypes.byref(chars_read))
+        return ctypes.string_at(char_buffer).decode('UTF-8')
+
+    def clear_line(self, y: int, x: int=0):
+        coord_screen = _COORD(x, y)
         chars_written = ctypes.c_ulong(0)
 
         console_info = self.__get_win32_console_screen_buffer_info()
@@ -297,9 +365,23 @@ class Console:
                                      console_info.srWindow.Right, coord_screen,
                                      ctypes.byref(chars_written))
 
+    def clear_line_until(self, x_end: int, y: int, x_start: int=0):
+        coord_screen = _COORD(x_start, y)
+        chars_written = ctypes.c_ulong(0)
+
+        console_info = self.__get_win32_console_screen_buffer_info()
+        max_length = console_info.srWindow.Right - console_info.srWindow.Left
+        if x_end >= console_info.srWindow.Right:
+            raise ConsoleError("x_end extends past the window size")
+
+        _FillConsoleOutputCharacterA(self.handle, ctypes.c_char(ord(' ')),
+                                     x_end, coord_screen,
+                                     ctypes.byref(chars_written))
+
+
 
 class ConsoleManager:
-    def __init__(self, std_handle=ConsoleStandardHandle.STD_INPUT_HANDLE):
+    def __init__(self, std_handle=ConsoleStandardHandle.STD_OUTPUT_HANDLE):
         self.console = Console(std_handle)
 
     def __enter__(self):
@@ -308,5 +390,86 @@ class ConsoleManager:
     def __exit__(self, type_, value, traceback):
         self.console.set_default_cursor_info()
         self.console.set_default_text_color()
-            
+
+
+def scroll_text_up(rectangle: Rectangle, clear_rows):
+    ci = console.get_console_info()
+    for row in range(rectangle.top + 1, ci.window_rectangle.bottom + 1 - rectangle.bottom - clear_rows):
+        for clear_row in range(clear_rows):
+            console.clear_line_until(ci.window_rectangle.right - rectangle.right - rectangle.left,
+                                     row - 1 + clear_row, x_start=rectangle.left)
+            line = console.read_console_line(row + clear_row)[rectangle.left:-rectangle.right]
+            console.set_cursor_pos(rectangle.left, row - 1 + clear_row)
+            print(line, end='', flush=True)
+
+
+TOP_PADDING = 5
+BOTTOM_PADDING = 5
+RIGHT_PADDING = 12
+LEFT_PADDING = 12
+
+if __name__ == "__main__":
+    with ConsoleManager() as console:
+        console.clear_screen()
+        ci = console.get_console_info()
+
+        padding_rectangle = Rectangle(LEFT_PADDING, TOP_PADDING, RIGHT_PADDING, BOTTOM_PADDING)
+
+        for padding_row in range(padding_rectangle.top):
+            console.set_cursor_pos(padding_rectangle.left, padding_row)
+            copy_str = "01"
+            if padding_row % 2 != 0:
+                copy_str = "10"
+            write_padding = copy_str * ((ci.window_rectangle.right - 1) // 2)
+            if (ci.window_rectangle.right - 1) % 2 != 0:
+                write_padding = write_padding[:-1]
+            print(write_padding, end='', flush=True)
+
+        for padding_row in range(ci.window_rectangle.bottom - padding_rectangle.bottom,
+                                 ci.window_rectangle.bottom + 1):
+            console.set_cursor_pos(padding_rectangle.left, padding_row)
+            copy_str = "01"
+            if padding_row % 2 != 0:
+                copy_str = "10"
+            write_padding = copy_str * ((ci.window_rectangle.right - 1) // 2)
+            if (ci.window_rectangle.right - 1) % 2 != 0:
+                write_padding = write_padding[:-1]
+            print(write_padding, end='', flush=True)
+
+        for row in range(ci.window_rectangle.bottom + 1):
+            console.set_cursor_pos(ci.window_rectangle.right - RIGHT_PADDING, row)
+            copy_str = "01"
+            if row % 2 != 0:
+                copy_str = "10"
+            write_padding = copy_str * (padding_rectangle.right + 1 // 2)
+            if ci.window_rectangle.right % 2 != 0:
+                write_padding = write_padding[:-1]
+            print(write_padding, end='', flush=True)
+
+        for row in range(ci.window_rectangle.bottom + 1):
+            console.set_cursor_pos(0, row)
+            copy_str = "01"
+            if row % 2 != 0:
+                copy_str = "10"
+            write_padding = copy_str * (padding_rectangle.left // 2)
+            if padding_rectangle.left % 2 != 0:
+                write_padding = write_padding[:-1]
+            print(write_padding, end='', flush=True)
+
+        while True:
+            ci = console.get_console_info()
+            console.set_cursor_pos(padding_rectangle.left, ci.window_rectangle.bottom - 1 - padding_rectangle.bottom)
+            console.clear_line_until(ci.window_rectangle.right - padding_rectangle.right - padding_rectangle.left,
+                                     ci.window_rectangle.bottom - 1 - padding_rectangle.bottom,
+                                     x_start=padding_rectangle.left)
+            console.set_text_color("bright white", "light red")
+            print('> ', end='', flush=True)
+            console.set_default_text_color()
+            line = input()
+
+            if line == "quit":
+                break
+
+            scroll_text_up(padding_rectangle, 1)
+                
 
