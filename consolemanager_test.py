@@ -24,7 +24,6 @@ class TestConsoleManager(unittest.TestCase):
         self.assertEqual(csi_new.cursor_position.y, t_y(csi.cursor_position.y))
 
     def test_read_console(self):
-        #TODO This is wrong
         csi = self.console.get_console_info()
 
         output = self.console.read_console()
